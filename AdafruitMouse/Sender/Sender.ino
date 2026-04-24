@@ -8,6 +8,10 @@
 #define VBAT_CUTOFF       3.2f // Shut down below this (LiPo safety floor)
 // ---------------------------------------------------------------------------
 
+// --- Yaw-to-cursor ---------------------------------------------------------
+#define YAW_GAIN          300  // Gyro Z (rad/s) contribution to x; tune to taste
+// ---------------------------------------------------------------------------
+
 Adafruit_MPU6050 mpu;
 
 BLEUart bleuart; // Create BLE UART service
@@ -96,6 +100,7 @@ void loop() {
 
   int16_t x = a.acceleration.x * 100;
   int16_t y = a.acceleration.y * 100;
+  x -= (int16_t)(g.gyro.z * YAW_GAIN);
 
   if (millis() - lastVbatCheck >= VBAT_CHECK_MS) {
     lastVbatCheck = millis();
