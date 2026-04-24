@@ -3,15 +3,35 @@
 #include <Adafruit_Sensor.h>
 #include <bluefruit.h>
 
+// --- Battery ---------------------------------------------------------------
+#define VBAT_CHECK_MS    1000  // How often to sample VBAT
+#define VBAT_CUTOFF       3.2f // Shut down below this (LiPo safety floor)
+// ---------------------------------------------------------------------------
+
 Adafruit_MPU6050 mpu;
 
 BLEUart bleuart; // Create BLE UART service
+
+float latestVbat = 0.0f;
+uint32_t lastVbatCheck = 0;
+
+float readBattery() {
+  // Feather nRF52840 Express: VBAT -> 1M/1M divider -> PIN_VBAT,
+  // read with 12-bit ADC against 3.0 V internal reference.
+  float raw = (float)analogRead(PIN_VBAT);
+  return raw * (3.0f / 4096.0f) * 2.0f;
+}
 
 void setup() {
   Serial.begin(9600);
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 2000) delay(10);
   pinMode(LED_BUILTIN, OUTPUT);
+
+  analogReference(AR_INTERNAL_3_0);
+  analogReadResolution(12);
+  analogRead(PIN_VBAT);  // Warm-up dummy read
+  delay(1);
 
   Bluefruit.begin();
   Bluefruit.setName("MPU6050_Sender");
@@ -77,15 +97,34 @@ void loop() {
   int16_t x = a.acceleration.x * 100;
   int16_t y = a.acceleration.y * 100;
 
+  if (millis() - lastVbatCheck >= VBAT_CHECK_MS) {
+    lastVbatCheck = millis();
+    latestVbat = readBattery();
+    if (latestVbat > 2.5f && latestVbat < VBAT_CUTOFF) {
+      Serial.print("Battery critical (");
+      Serial.print(latestVbat, 2);
+      Serial.println(" V) - shutting down for LiPo safety");
+      Bluefruit.Advertising.stop();
+      if (Bluefruit.connected()) {
+        Bluefruit.disconnect(Bluefruit.connHandle());
+      }
+      while (1) {
+        digitalWrite(LED_BUILTIN, HIGH); delay(500);
+        digitalWrite(LED_BUILTIN, LOW);  delay(500);
+      }
+    }
+  }
+
   if (Serial) {
     Serial.print(x);
     Serial.print(" ");
     Serial.print(y);
-    Serial.println();
+    Serial.print(" vbat=");
+    Serial.println(latestVbat, 2);
   }
 
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%d,%d\n", x, y);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%d,%d,%.2f\n", x, y, latestVbat);
   bleuart.print(buf);
 
   delay(20);

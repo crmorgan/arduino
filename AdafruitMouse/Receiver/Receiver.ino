@@ -11,6 +11,8 @@ Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 #define ACCEL_DIVISOR     800  // Quadratic curve divisor; lower = faster
 #define OUTPUT_CLAMP       50  // Max per-sample cursor delta
 #define AUTO_CAL_MS      1500  // Averaging window for auto-calibrate on connect
+#define VBAT_WARN         3.5f // Below this: NeoPixel goes yellow
+#define VBAT_DANGER       3.3f // Below this: NeoPixel flashes red
 // ---------------------------------------------------------------------------
 
 uint8_t const desc_hid_report[] = { TUD_HID_REPORT_DESC_MOUSE() };
@@ -26,6 +28,7 @@ ezButton calibrateButton(CALIBRATE_BUTTON_PIN);
 
 volatile int16_t latestX = 0;
 volatile int16_t latestY = 0;
+volatile float latestVbat = 0.0f;
 volatile bool dataValid = false;
 
 int16_t xOffset = 0;
@@ -71,8 +74,6 @@ void connect_callback(uint16_t conn_handle) {
     calCount = 0;
     calStart = millis();
     calibrating = true;
-    pixel.setPixelColor(0, pixel.Color(0, 0, 255));
-    pixel.show();
   } else {
     Serial.println("BLE UART service NOT found on peer. Disconnecting.");
     Bluefruit.disconnect(conn_handle);
@@ -83,6 +84,29 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
   (void) conn_handle;
   Serial.print("Disconnected, reason 0x");
   Serial.println(reason, HEX);
+  mouseEnabled = false;  // Safety: don't keep sending stale deltas on reconnect.
+  calibrating = false;
+}
+
+void updatePixel() {
+  static uint32_t lastColor = 0xFFFFFFFF;
+  uint32_t color = 0;
+
+  if (calibrating) {
+    color = pixel.Color(0, 0, 255);  // Blue
+  } else if (latestVbat > 0.0f && latestVbat < VBAT_DANGER) {
+    color = ((millis() / 500) % 2) ? pixel.Color(255, 0, 0) : 0;  // Red blink
+  } else if (latestVbat > 0.0f && latestVbat < VBAT_WARN) {
+    color = pixel.Color(255, 255, 0);  // Yellow
+  } else if (mouseEnabled) {
+    color = pixel.Color(0, 255, 0);  // Green
+  }
+
+  if (color != lastColor) {
+    pixel.setPixelColor(0, color);
+    pixel.show();
+    lastColor = color;
+  }
 }
 
 void bleuart_rx_callback(BLEClientUart& uart_svc) {
@@ -94,11 +118,19 @@ void bleuart_rx_callback(BLEClientUart& uart_svc) {
     if (c == '\n' || c == '\r') {
       if (rxlen == 0) continue;
       rxbuf[rxlen] = '\0';
-      char* comma = strchr(rxbuf, ',');
-      if (comma) {
-        *comma = '\0';
+      char* comma1 = strchr(rxbuf, ',');
+      if (comma1) {
+        *comma1 = '\0';
         latestX = (int16_t)atoi(rxbuf);
-        latestY = (int16_t)atoi(comma + 1);
+        char* rest = comma1 + 1;
+        char* comma2 = strchr(rest, ',');
+        if (comma2) {
+          *comma2 = '\0';
+          latestY = (int16_t)atoi(rest);
+          latestVbat = (float)atof(comma2 + 1);
+        } else {
+          latestY = (int16_t)atoi(rest);
+        }
         dataValid = true;
       }
       rxlen = 0;
@@ -157,12 +189,8 @@ void loop() {
       calCount = 0;
       calStart = millis();
       calibrating = true;
-      pixel.setPixelColor(0, pixel.Color(0, 0, 255));
-      pixel.show();
       Serial.println("Mouse enabled: ON. Auto-calibrating - hold still...");
     } else {
-      pixel.setPixelColor(0, 0);
-      pixel.show();
       Serial.println("Mouse enabled: OFF");
     }
   }
@@ -195,9 +223,8 @@ void loop() {
         Serial.println("Auto-cal window ended with no samples; offsets unchanged.");
       }
       calibrating = false;
-      pixel.setPixelColor(0, mouseEnabled ? pixel.Color(0, 255, 0) : 0);
-      pixel.show();
     }
+    updatePixel();
     return;
   }
 
@@ -229,7 +256,11 @@ void loop() {
       Serial.print(" dx=");
       Serial.print(dx);
       Serial.print(" dy=");
-      Serial.println(dy);
+      Serial.print(dy);
+      Serial.print(" vbat=");
+      Serial.println(latestVbat, 2);
     }
   }
+
+  updatePixel();
 }
