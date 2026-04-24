@@ -9,7 +9,8 @@ BLEUart bleuart; // Create BLE UART service
 
 void setup() {
   Serial.begin(9600);
-  while (!Serial) delay(10);
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 2000) delay(10);
   pinMode(LED_BUILTIN, OUTPUT);
 
   Bluefruit.begin();
@@ -76,10 +77,12 @@ void loop() {
   int16_t x = a.acceleration.x * 100;
   int16_t y = a.acceleration.y * 100;
 
-  Serial.print(x);
-  Serial.print(" ");
-  Serial.print(y);
-  Serial.println();
+  if (Serial) {
+    Serial.print(x);
+    Serial.print(" ");
+    Serial.print(y);
+    Serial.println();
+  }
 
   char buf[16];
   snprintf(buf, sizeof(buf), "%d,%d\n", x, y);

@@ -1,13 +1,16 @@
 #include <bluefruit.h>
 #include <ezButton.h>
 #include <Adafruit_TinyUSB.h>
+#include <Adafruit_NeoPixel.h>
+
+Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
 // --- Tuning ----------------------------------------------------------------
 #define INPUT_MAX         200  // Approx max raw accel value (a * 100 at 2g)
 #define DEADZONE_RAW       10  // Ignore tilts inside this raw range (noise)
 #define ACCEL_DIVISOR     800  // Quadratic curve divisor; lower = faster
 #define OUTPUT_CLAMP       50  // Max per-sample cursor delta
-#define AUTO_CAL_MS       500  // Averaging window for auto-calibrate on connect
+#define AUTO_CAL_MS      1500  // Averaging window for auto-calibrate on connect
 // ---------------------------------------------------------------------------
 
 uint8_t const desc_hid_report[] = { TUD_HID_REPORT_DESC_MOUSE() };
@@ -68,6 +71,8 @@ void connect_callback(uint16_t conn_handle) {
     calCount = 0;
     calStart = millis();
     calibrating = true;
+    pixel.setPixelColor(0, pixel.Color(0, 0, 255));
+    pixel.show();
   } else {
     Serial.println("BLE UART service NOT found on peer. Disconnecting.");
     Bluefruit.disconnect(conn_handle);
@@ -117,8 +122,10 @@ void setup() {
   enableButton.setDebounceTime(50);
   calibrateButton.setDebounceTime(50);
 
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
+  pixel.begin();
+  pixel.setBrightness(30);
+  pixel.clear();
+  pixel.show();
 
   Bluefruit.begin(0, 1);
   Bluefruit.setName("MPU6050_Receiver");
@@ -142,11 +149,22 @@ void loop() {
   enableButton.loop();
   calibrateButton.loop();
 
-  if (enableButton.isPressed()) {
+  if (enableButton.isPressed() && !calibrating) {
     mouseEnabled = !mouseEnabled;
-    digitalWrite(LED_BUILTIN, mouseEnabled ? HIGH : LOW);
-    Serial.print("Mouse enabled: ");
-    Serial.println(mouseEnabled ? "ON" : "OFF");
+    if (mouseEnabled) {
+      calSumX = 0;
+      calSumY = 0;
+      calCount = 0;
+      calStart = millis();
+      calibrating = true;
+      pixel.setPixelColor(0, pixel.Color(0, 0, 255));
+      pixel.show();
+      Serial.println("Mouse enabled: ON. Auto-calibrating - hold still...");
+    } else {
+      pixel.setPixelColor(0, 0);
+      pixel.show();
+      Serial.println("Mouse enabled: OFF");
+    }
   }
 
   if (calibrateButton.isPressed()) {
@@ -177,6 +195,8 @@ void loop() {
         Serial.println("Auto-cal window ended with no samples; offsets unchanged.");
       }
       calibrating = false;
+      pixel.setPixelColor(0, mouseEnabled ? pixel.Color(0, 255, 0) : 0);
+      pixel.show();
     }
     return;
   }
