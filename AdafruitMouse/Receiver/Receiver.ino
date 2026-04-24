@@ -8,7 +8,7 @@ Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 // --- Tuning ----------------------------------------------------------------
 #define INPUT_MAX         200  // Approx max raw accel value (a * 100 at 2g)
 #define DEADZONE_RAW       10  // Ignore tilts inside this raw range (noise)
-#define ACCEL_DIVISOR     800  // Quadratic curve divisor; lower = faster
+#define ACCEL_DIVISOR   12000  // x^2.5 curve divisor; lower = faster
 #define OUTPUT_CLAMP       50  // Max per-sample cursor delta
 #define AUTO_CAL_MS      1500  // Averaging window for auto-calibrate on connect
 #define VBAT_WARN         3.5f // Below this: NeoPixel goes yellow
@@ -238,10 +238,22 @@ void loop() {
     if (raw_x > -DEADZONE_RAW && raw_x < DEADZONE_RAW) raw_x = 0;
     if (raw_y > -DEADZONE_RAW && raw_y < DEADZONE_RAW) raw_y = 0;
 
-    long dx = (long)raw_x * (raw_x < 0 ? -raw_x : raw_x) / ACCEL_DIVISOR;
-    long dy = (long)raw_y * (raw_y < 0 ? -raw_y : raw_y) / ACCEL_DIVISOR;
-    dx = constrain(dx, -OUTPUT_CLAMP, OUTPUT_CLAMP);
-    dy = constrain(dy, -OUTPUT_CLAMP, OUTPUT_CLAMP);
+    static float dxAccum = 0.0f;
+    static float dyAccum = 0.0f;
+    float absX = fabsf((float)raw_x);
+    float absY = fabsf((float)raw_y);
+    float magX = absX * absX * sqrtf(absX) / (float)ACCEL_DIVISOR;
+    float magY = absY * absY * sqrtf(absY) / (float)ACCEL_DIVISOR;
+    float step_x = raw_x < 0 ? -magX : magX;
+    float step_y = raw_y < 0 ? -magY : magY;
+    step_x = constrain(step_x, (float)-OUTPUT_CLAMP, (float)OUTPUT_CLAMP);
+    step_y = constrain(step_y, (float)-OUTPUT_CLAMP, (float)OUTPUT_CLAMP);
+    dxAccum += step_x;
+    dyAccum += step_y;
+    long dx = (long)dxAccum;
+    long dy = (long)dyAccum;
+    dxAccum -= dx;
+    dyAccum -= dy;
 
     if (mouseEnabled && TinyUSBDevice.mounted() && usb_hid.ready()
         && (dx != 0 || dy != 0)) {
