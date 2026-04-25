@@ -3,6 +3,7 @@
 #include <Adafruit_Sensor.h>
 #include <bluefruit.h>
 #include <ezButton.h>
+#include <Adafruit_NeoPixel.h>
 
 // --- Battery ---------------------------------------------------------------
 #define VBAT_CHECK_MS      1000  // How often to sample VBAT
@@ -25,6 +26,8 @@
 Adafruit_MPU6050 mpu;
 
 BLEUart bleuart; // Create BLE UART service
+
+Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
 ezButton sleepButton(SLEEP_BUTTON_PIN);
 
@@ -52,49 +55,64 @@ void enterSleep(const char* reason) {
   Serial.println(reason);
   delay(100);
 
-  // Tell Bluefruit not to auto-restart advertising when we disconnect.
-  Bluefruit.Advertising.restartOnDisconnect(false);
+  // MPU into ~5 uA sleep before we lose I2C control via softdevice disable.
+  mpu.enableSleep(true);
 
+  // Cleanly stop BLE so the disconnect propagates to the Receiver.
+  Bluefruit.Advertising.restartOnDisconnect(false);
   if (Bluefruit.connected()) {
+    // Send a sentinel so the Receiver knows this disconnect was intentional.
+    bleuart.print("SLEEP\n");
+    delay(50);
     Bluefruit.disconnect(Bluefruit.connHandle());
     delay(100);
   }
   Bluefruit.Advertising.stop();
   delay(200);
 
-  // Wait for USER SW release before entering the sleep loop, otherwise
-  // we'd wake immediately on the still-pressed button.
+  // Wait for USER SW release before configuring the sense source,
+  // otherwise the still-pressed button triggers immediate wake.
   pinMode(SLEEP_BUTTON_PIN, INPUT_PULLUP);
   while (digitalRead(SLEEP_BUTTON_PIN) == LOW) {
     delay(10);
   }
   delay(50);
 
-  // System ON idle - CPU sleeps, softdevice timers keep ticking. Wake on
-  // any softdevice event or interrupt, then re-check the button.
+  // Disable softdevice and USB - stops all BLE / FreeRTOS / USB overhead.
+  // We will cold-boot on wake to re-initialize them via setup().
+  sd_softdevice_disable();
+  NRF_USBD->ENABLE = 0;
+
+  // Configure USER SW as GPIO sense wake source.
+  nrf_gpio_cfg_sense_input(g_ADigitalPinMap[SLEEP_BUTTON_PIN],
+                           NRF_GPIO_PIN_PULLUP,
+                           NRF_GPIO_PIN_SENSE_LOW);
+  // Clear stale latches so a prior LOW state doesn't trigger immediate wake.
+  NRF_P0->LATCH = NRF_P0->LATCH;
+  NRF_P1->LATCH = NRF_P1->LATCH;
+  // Clear bootloader retention so reset boots app, not DFU.
+  NRF_POWER->GPREGRET  = 0;
+  NRF_POWER->GPREGRET2 = 0;
+  NRF_POWER->RESETREAS = 0xFFFFFFFF;
+
+  // Raw WFE sleep loop. CPU halts until GPIO sense fires.
   while (digitalRead(SLEEP_BUTTON_PIN) == HIGH) {
-    sd_app_evt_wait();
+    __WFE();
+    __SEV();
+    __WFE();
   }
 
-  // Button pressed - debounce, wait for release, then resume.
-  delay(50);
-  while (digitalRead(SLEEP_BUTTON_PIN) == LOW) {
-    delay(10);
-  }
-  delay(50);
+  // Button pressed - cold-boot to re-init everything cleanly.
+  delay(50);  // brief debounce
 
-  Serial.println("Resumed from sleep");
-  Bluefruit.Advertising.restartOnDisconnect(true);
-  Bluefruit.Advertising.start(0);
+  // Tell the Adafruit bootloader to skip its DFU check and boot the app.
+  // 0x6D == DFU_MAGIC_SKIP; the double-tap magic at 0x20007F7C also gets
+  // cleared so a stale value doesn't override.
+  NRF_POWER->GPREGRET = 0x6D;
+  *(volatile uint32_t*)0x20007F7C = 0;
 
-  // Drain any stale button events queued up during the wake transitions
-  // so we don't immediately re-trigger sleep on the next loop iteration.
-  for (int i = 0; i < 10; i++) {
-    sleepButton.loop();
-    delay(20);
-  }
-  (void)sleepButton.isPressed();
-  (void)sleepButton.isReleased();
+  NVIC_SystemReset();
+  while (1);  // unreachable
 }
 
 void setup() {
@@ -110,6 +128,17 @@ void setup() {
 
   sleepButton.setDebounceTime(50);
   lastMotionMs = millis();
+
+  // Clear any leftover bootloader NeoPixel state. Do it twice with a
+  // small delay - the first show() right after begin() can miss the
+  // first reset window on some boards.
+  pixel.begin();
+  pixel.setBrightness(30);
+  pixel.setPixelColor(0, 0, 0, 0);
+  pixel.show();
+  delay(10);
+  pixel.setPixelColor(0, 0, 0, 0);
+  pixel.show();
 
   Bluefruit.begin();
   Bluefruit.setName("MPU6050_Sender");
@@ -232,7 +261,9 @@ void loop() {
     }
   }
 
-  if (Serial) {
+  static uint8_t logCounter = 0;
+  if (Serial && ++logCounter >= 10) {
+    logCounter = 0;
     Serial.print(x);
     Serial.print(" ");
     Serial.print(y);

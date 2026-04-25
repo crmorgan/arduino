@@ -41,6 +41,9 @@ int32_t calSumX = 0;
 int32_t calSumY = 0;
 uint16_t calCount = 0;
 
+volatile bool senderRequestedSleep = false;
+uint32_t purpleUntil = 0;
+
 void scan_callback(ble_gap_evt_adv_report_t* report) {
   char name[32] = {0};
   Bluefruit.Scanner.parseReportByType(
@@ -84,6 +87,11 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
   (void) conn_handle;
   Serial.print("Disconnected, reason 0x");
   Serial.println(reason, HEX);
+  if (senderRequestedSleep) {
+    Serial.println("Sender went to sleep intentionally.");
+    purpleUntil = millis() + 2000;
+    senderRequestedSleep = false;
+  }
   mouseEnabled = false;  // Safety: don't keep sending stale deltas on reconnect.
   calibrating = false;
 }
@@ -92,7 +100,9 @@ void updatePixel() {
   static uint32_t lastColor = 0xFFFFFFFF;
   uint32_t color = 0;
 
-  if (calibrating) {
+  if (millis() < purpleUntil) {
+    color = pixel.Color(180, 0, 200);  // Purple - Sender intentionally slept
+  } else if (calibrating) {
     color = pixel.Color(0, 0, 255);  // Blue
   } else if (latestVbat > 0.0f && latestVbat < VBAT_DANGER) {
     color = ((millis() / 500) % 2) ? pixel.Color(255, 0, 0) : 0;  // Red blink
@@ -118,6 +128,11 @@ void bleuart_rx_callback(BLEClientUart& uart_svc) {
     if (c == '\n' || c == '\r') {
       if (rxlen == 0) continue;
       rxbuf[rxlen] = '\0';
+      if (strcmp(rxbuf, "SLEEP") == 0) {
+        senderRequestedSleep = true;
+        rxlen = 0;
+        continue;
+      }
       char* comma1 = strchr(rxbuf, ',');
       if (comma1) {
         *comma1 = '\0';
