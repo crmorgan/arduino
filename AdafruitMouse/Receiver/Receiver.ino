@@ -6,13 +6,14 @@
 Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
 // --- Tuning ----------------------------------------------------------------
-#define INPUT_MAX         200  // Approx max raw accel value (a * 100 at 2g)
-#define DEADZONE_RAW       10  // Ignore tilts inside this raw range (noise)
-#define ACCEL_DIVISOR   12000  // x^2.5 curve divisor; lower = faster
-#define OUTPUT_CLAMP       50  // Max per-sample cursor delta
-#define AUTO_CAL_MS      1500  // Averaging window for auto-calibrate on connect
-#define VBAT_WARN         3.5f // Below this: NeoPixel goes yellow
-#define VBAT_DANGER       3.3f // Below this: NeoPixel flashes red
+#define INPUT_MAX           200   // Approx max raw accel value (a * 100 at 2g)
+#define DEADZONE_RAW         10   // Radial deadzone radius in raw units (noise)
+#define ACCEL_DIVISOR     12000   // x^2.5 curve divisor; lower = faster
+#define OUTPUT_CLAMP         50   // Max per-sample cursor delta
+#define AUTO_CAL_MS        1500   // Averaging window for auto-calibrate on connect
+#define VBAT_WARN            3.5f // Below this: NeoPixel goes yellow
+#define VBAT_DANGER          3.3f // Below this: NeoPixel flashes red
+#define BAD_PACKET_LOG_MS  5000   // Throttle "discarded BLE packets" log
 // ---------------------------------------------------------------------------
 
 uint8_t const desc_hid_report[] = { TUD_HID_REPORT_DESC_MOUSE() };
@@ -35,6 +36,11 @@ int16_t xOffset = 0;
 int16_t yOffset = 0;
 bool mouseEnabled = false;
 
+// Sub-pixel cursor accumulators. File-scope so we can zero them on every
+// auto-cal start and not carry residual across sessions.
+float dxAccum = 0.0f;
+float dyAccum = 0.0f;
+
 volatile bool calibrating = false;
 uint32_t calStart = 0;
 int32_t calSumX = 0;
@@ -43,6 +49,10 @@ uint16_t calCount = 0;
 
 volatile bool senderRequestedSleep = false;
 uint32_t purpleUntil = 0;
+
+// Counts BLE frames dropped for bad framing/prefix. Throttled-logged from loop.
+volatile uint32_t badPacketCount = 0;
+uint32_t lastBadPacketLog = 0;
 
 void scan_callback(ble_gap_evt_adv_report_t* report) {
   char name[32] = {0};
@@ -76,6 +86,8 @@ void connect_callback(uint16_t conn_handle) {
     calSumY = 0;
     calCount = 0;
     calStart = millis();
+    dxAccum = 0.0f;
+    dyAccum = 0.0f;
     calibrating = true;
   } else {
     Serial.println("BLE UART service NOT found on peer. Disconnecting.");
@@ -91,8 +103,10 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
     Serial.println("Sender went to sleep intentionally.");
     purpleUntil = millis() + 2000;
     senderRequestedSleep = false;
+    // Sleep is "I'm done"; require explicit re-enable on wake.
+    mouseEnabled = false;
   }
-  mouseEnabled = false;  // Safety: don't keep sending stale deltas on reconnect.
+  // Transient drops keep mouseEnabled; reconnect auto-cal handles freshness.
   calibrating = false;
 }
 
@@ -117,15 +131,28 @@ uint8_t vbatToPercent(float v) {
 void updatePixel() {
   static uint32_t lastColor = 0xFFFFFFFF;
   uint32_t color = 0;
+  bool blinkPhase = ((millis() / 500) % 2) != 0;
 
   if (millis() < purpleUntil) {
     color = pixel.Color(180, 0, 200);  // Purple - Sender intentionally slept
   } else if (calibrating) {
     color = pixel.Color(0, 0, 255);  // Blue
   } else if (latestVbat > 0.0f && latestVbat < VBAT_DANGER) {
-    color = ((millis() / 500) % 2) ? pixel.Color(255, 0, 0) : 0;  // Red blink
+    // Danger: red blink. When mouse is enabled, off-phase becomes green so
+    // the enabled cue is still visible while the user reaches for a charger.
+    if (blinkPhase) {
+      color = pixel.Color(255, 0, 0);
+    } else {
+      color = mouseEnabled ? pixel.Color(0, 255, 0) : 0;
+    }
   } else if (latestVbat > 0.0f && latestVbat < VBAT_WARN) {
-    color = pixel.Color(255, 255, 0);  // Yellow
+    // Warn: solid yellow when disabled; alternate yellow/green at 1 Hz when
+    // enabled, so both battery state and enabled state are readable at once.
+    if (mouseEnabled && blinkPhase) {
+      color = pixel.Color(0, 255, 0);
+    } else {
+      color = pixel.Color(255, 255, 0);
+    }
   } else if (mouseEnabled) {
     color = pixel.Color(0, 255, 0);  // Green
   }
@@ -148,31 +175,62 @@ void bleuart_rx_callback(BLEClientUart& uart_svc) {
       rxbuf[rxlen] = '\0';
       if (strcmp(rxbuf, "SLEEP") == 0) {
         senderRequestedSleep = true;
-        rxlen = 0;
-        continue;
-      }
-      char* comma1 = strchr(rxbuf, ',');
-      if (comma1) {
-        *comma1 = '\0';
-        latestX = (int16_t)atoi(rxbuf);
-        char* rest = comma1 + 1;
-        char* comma2 = strchr(rest, ',');
-        if (comma2) {
-          *comma2 = '\0';
-          latestY = (int16_t)atoi(rest);
-          latestVbat = (float)atof(comma2 + 1);
+      } else if (rxbuf[0] == 'M' && rxlen > 1) {
+        // Movement packet: M<x>,<y>,<vbat>
+        char* body = rxbuf + 1;
+        char* comma1 = strchr(body, ',');
+        if (comma1) {
+          *comma1 = '\0';
+          int16_t newX = (int16_t)atoi(body);
+          int16_t newY;
+          float   newVbat = latestVbat;
+          char* rest = comma1 + 1;
+          char* comma2 = strchr(rest, ',');
+          if (comma2) {
+            *comma2 = '\0';
+            newY = (int16_t)atoi(rest);
+            newVbat = (float)atof(comma2 + 1);
+          } else {
+            newY = (int16_t)atoi(rest);
+          }
+          // Publish all three together so the main loop's snapshot sees a
+          // coherent triple rather than a torn mix from two packets.
+          noInterrupts();
+          latestX = newX;
+          latestY = newY;
+          latestVbat = newVbat;
+          dataValid = true;
+          interrupts();
         } else {
-          latestY = (int16_t)atoi(rest);
+          badPacketCount++;
         }
-        dataValid = true;
+      } else {
+        badPacketCount++;
       }
       rxlen = 0;
     } else if (rxlen < sizeof(rxbuf) - 1) {
       rxbuf[rxlen++] = c;
     } else {
       rxlen = 0;  // Overflow, discard.
+      badPacketCount++;
     }
   }
+}
+
+// Atomically read the latest BLE packet. Returns true and clears dataValid
+// when a fresh packet was consumed; false when no new data.
+bool snapshotRx(int16_t& x, int16_t& y, float& vbat) {
+  bool got;
+  noInterrupts();
+  got = dataValid;
+  if (got) {
+    x = latestX;
+    y = latestY;
+    vbat = latestVbat;
+    dataValid = false;
+  }
+  interrupts();
+  return got;
 }
 
 void setup() {
@@ -221,6 +279,8 @@ void loop() {
       calSumY = 0;
       calCount = 0;
       calStart = millis();
+      dxAccum = 0.0f;
+      dyAccum = 0.0f;
       calibrating = true;
       Serial.println("Mouse enabled: ON. Auto-calibrating - hold still...");
     } else {
@@ -229,19 +289,45 @@ void loop() {
   }
 
   if (calibrateButton.isPressed()) {
-    xOffset = latestX;
-    yOffset = latestY;
+    int16_t snapX, snapY;
+    noInterrupts();
+    snapX = latestX;
+    snapY = latestY;
+    interrupts();
+    xOffset = snapX;
+    yOffset = snapY;
     Serial.print("Calibrated - x: ");
     Serial.print(xOffset);
     Serial.print(" y: ");
     Serial.println(yOffset);
   }
 
+  // Throttled report on dropped packets, so silent corruption surfaces.
+  // Logs only when new bad packets have arrived since the last report.
+  static uint32_t lastBadPacketCount = 0;
+  uint32_t badNow;
+  noInterrupts();
+  badNow = badPacketCount;
+  interrupts();
+  if (Serial && badNow > lastBadPacketCount
+      && millis() - lastBadPacketLog > BAD_PACKET_LOG_MS) {
+    Serial.print("Discarded BLE packets (bad framing/prefix): ");
+    Serial.print(badNow - lastBadPacketCount);
+    Serial.print(" new, ");
+    Serial.print(badNow);
+    Serial.println(" total");
+    lastBadPacketCount = badNow;
+    lastBadPacketLog = millis();
+  }
+
+  int16_t curX = 0, curY = 0;
+  float   curVbat = 0.0f;
+  bool fresh = snapshotRx(curX, curY, curVbat);
+
   if (calibrating) {
-    if (dataValid) {
-      dataValid = false;
-      calSumX += latestX;
-      calSumY += latestY;
+    if (fresh) {
+      calSumX += curX;
+      calSumY += curY;
       calCount++;
     }
     if (millis() - calStart >= AUTO_CAL_MS) {
@@ -261,18 +347,20 @@ void loop() {
     return;
   }
 
-  if (dataValid) {
-    dataValid = false;
-
-    int16_t raw_x = latestX - xOffset;
-    int16_t raw_y = latestY - yOffset;
+  if (fresh) {
+    int16_t raw_x = curX - xOffset;
+    int16_t raw_y = curY - yOffset;
     raw_x = constrain(raw_x, -INPUT_MAX, INPUT_MAX);
     raw_y = constrain(raw_y, -INPUT_MAX, INPUT_MAX);
-    if (raw_x > -DEADZONE_RAW && raw_x < DEADZONE_RAW) raw_x = 0;
-    if (raw_y > -DEADZONE_RAW && raw_y < DEADZONE_RAW) raw_y = 0;
 
-    static float dxAccum = 0.0f;
-    static float dyAccum = 0.0f;
+    // Radial deadzone: prevents axis-aligned drift when one axis is just
+    // inside its threshold and the other just outside.
+    int32_t mag2 = (int32_t)raw_x * raw_x + (int32_t)raw_y * raw_y;
+    if (mag2 < (int32_t)DEADZONE_RAW * DEADZONE_RAW) {
+      raw_x = 0;
+      raw_y = 0;
+    }
+
     float absX = fabsf((float)raw_x);
     float absY = fabsf((float)raw_y);
     float magX = absX * absX * sqrtf(absX) / (float)ACCEL_DIVISOR;
@@ -294,7 +382,7 @@ void loop() {
     }
 
     static uint8_t logCounter = 0;
-    if (++logCounter >= 10) {
+    if (Serial && ++logCounter >= 10) {
       logCounter = 0;
       Serial.print("enabled=");
       Serial.print(mouseEnabled ? 1 : 0);
@@ -303,9 +391,9 @@ void loop() {
       Serial.print(" dy=");
       Serial.print(dy);
       Serial.print(" vbat=");
-      Serial.print(latestVbat, 2);
+      Serial.print(curVbat, 2);
       Serial.print(" (");
-      Serial.print(vbatToPercent(latestVbat));
+      Serial.print(vbatToPercent(curVbat));
       Serial.println("%)");
     }
   }

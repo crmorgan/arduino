@@ -93,8 +93,11 @@ packet. The Receiver displays the voltage in its throttled debug log
 and adjusts the NeoPixel color based on level:
 
 - **Green / off / blue**: state colors (enabled / disabled / calibrating)
-- **Yellow**: battery warning (below 3.5 V, ~15% remaining)
-- **Blinking red**: battery danger (below 3.3 V, ~5% remaining)
+- **Yellow**: battery warning (below 3.5 V, ~15% remaining). Solid when the
+  mouse is disabled; alternates yellow/green at 1 Hz when enabled, so both
+  battery state and enabled state stay visible.
+- **Blinking red**: battery danger (below 3.3 V, ~5% remaining). The off-phase
+  becomes green while the mouse is enabled.
 - **Purple flash**: Sender just intentionally slept (vs unexpected drop)
 
 Below 3.2 V the Sender enters a hardware-safe cutoff: stops BLE,
@@ -111,8 +114,10 @@ Sleep extends this dramatically when not actively in use.
 | Off | Mouse disabled / idle |
 | Blue | Auto-calibrating (1.5 s after BLE connect or enable press) |
 | Green | Mouse enabled |
-| Yellow | Battery warning (< 3.5 V) |
-| Blinking red | Battery danger (< 3.3 V) |
+| Yellow (solid) | Battery warning (< 3.5 V), mouse disabled |
+| Yellow / green alternating @ 1 Hz | Battery warning, mouse enabled |
+| Red blinking | Battery danger (< 3.3 V), mouse disabled |
+| Red / green alternating @ 1 Hz | Battery danger, mouse enabled |
 | Purple | Sender just intentionally slept (~2 s flash) |
 
 ## Upload quirks

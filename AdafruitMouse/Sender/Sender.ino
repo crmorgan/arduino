@@ -6,10 +6,11 @@
 #include <Adafruit_NeoPixel.h>
 
 // --- Battery ---------------------------------------------------------------
-#define VBAT_CHECK_MS      1000  // How often to sample VBAT
-#define VBAT_CUTOFF         3.2f // Shut down below this (LiPo safety floor)
-#define VBAT_CUTOFF_HITS   5     // Consecutive low samples before cutoff fires
-#define STARTUP_GRACE_MS   5000  // Ignore cutoff for first N ms after boot
+#define VBAT_CHECK_MS       1000   // How often to sample VBAT
+#define VBAT_CUTOFF          3.2f  // Shut down below this (LiPo safety floor)
+#define VBAT_CUTOFF_HITS    5      // Consecutive low samples before cutoff fires
+#define STARTUP_GRACE_MS    5000   // Ignore cutoff for first N ms after boot
+#define VBAT_EMA_ALPHA       0.25f // New-sample weight in running mean (~4-tap)
 // ---------------------------------------------------------------------------
 
 // --- Yaw-to-cursor ---------------------------------------------------------
@@ -17,10 +18,11 @@
 // ---------------------------------------------------------------------------
 
 // --- Sleep / power-off ----------------------------------------------------
-#define SLEEP_BUTTON_PIN     PIN_BUTTON1
-#define SLEEP_AFTER_MS       (10UL * 60UL * 1000UL)  // 10 min inactivity -> sleep
-#define MOTION_ACCEL_DELTA   20     // Per-axis tick change that counts as motion
-#define MOTION_GYRO_RAD      0.15f  // Yaw rate that counts as motion (~8.6 deg/s)
+#define SLEEP_BUTTON_PIN          PIN_BUTTON1
+#define SLEEP_AFTER_MS            (10UL * 60UL * 1000UL)  // 10 min inactivity -> sleep
+#define MOTION_ACCEL_DELTA        20     // Per-axis tick change that counts as motion
+#define MOTION_GYRO_RAD           0.15f  // Yaw rate that counts as motion (~8.6 deg/s)
+#define SLEEP_RELEASE_TIMEOUT_MS  5000   // Reboot if USER SW stuck low this long
 // ---------------------------------------------------------------------------
 
 Adafruit_MPU6050 mpu;
@@ -73,7 +75,14 @@ void enterSleep(const char* reason) {
   // Wait for USER SW release before configuring the sense source,
   // otherwise the still-pressed button triggers immediate wake.
   pinMode(SLEEP_BUTTON_PIN, INPUT_PULLUP);
+  uint32_t releaseStart = millis();
   while (digitalRead(SLEEP_BUTTON_PIN) == LOW) {
+    if (millis() - releaseStart > SLEEP_RELEASE_TIMEOUT_MS) {
+      // Stuck button: reboot so the user isn't locked in a hung sleep path.
+      Serial.println("Sleep button held too long; rebooting");
+      delay(50);
+      NVIC_SystemReset();
+    }
     delay(10);
   }
   delay(50);
@@ -194,8 +203,11 @@ void loop() {
         Serial.println("MPU re-init ok");
         failedRecoveries = 0;
       } else {
-        Serial.println("MPU re-init FAILED");
-        if (++failedRecoveries >= 3) {
+        ++failedRecoveries;
+        Serial.print("MPU re-init FAILED (failedRecoveries=");
+        Serial.print(failedRecoveries);
+        Serial.println(")");
+        if (failedRecoveries >= 3) {
           Serial.println("Multiple recoveries failed - system reset");
           delay(100);
           NVIC_SystemReset();
@@ -231,7 +243,13 @@ void loop() {
 
   if (millis() - lastVbatCheck >= VBAT_CHECK_MS) {
     lastVbatCheck = millis();
-    latestVbat = readBattery();
+    float vbatSample = readBattery();
+    if (latestVbat == 0.0f) {
+      latestVbat = vbatSample;  // Seed: avoid slow ramp from 0.
+    } else {
+      latestVbat = latestVbat * (1.0f - VBAT_EMA_ALPHA)
+                 + vbatSample * VBAT_EMA_ALPHA;
+    }
 
     static uint8_t cutoffHits = 0;
     bool lowReading = millis() > STARTUP_GRACE_MS
@@ -271,8 +289,10 @@ void loop() {
     Serial.println(latestVbat, 2);
   }
 
-  char buf[24];
-  snprintf(buf, sizeof(buf), "%d,%d,%.2f\n", x, y, latestVbat);
+  // 'M' prefix lets the Receiver discard non-movement junk (BLE flake, partial
+  // frames, future protocol drift) instead of feeding atoi() = 0 to the cursor.
+  char buf[25];
+  snprintf(buf, sizeof(buf), "M%d,%d,%.2f\n", x, y, latestVbat);
   bleuart.print(buf);
 
   delay(20);
