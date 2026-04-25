@@ -96,6 +96,24 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
   calibrating = false;
 }
 
+uint8_t vbatToPercent(float v) {
+  // Piecewise linear approximation of LiPo discharge curve.
+  static const struct { float volts; uint8_t pct; } curve[] = {
+    {4.20f, 100}, {4.00f, 85}, {3.85f, 70}, {3.70f, 50},
+    {3.60f, 30}, {3.50f, 15}, {3.40f, 5},  {3.30f, 0}
+  };
+  if (v >= curve[0].volts) return 100;
+  for (size_t i = 0; i < sizeof(curve)/sizeof(curve[0]) - 1; i++) {
+    if (v >= curve[i + 1].volts) {
+      float vSpan  = curve[i].volts - curve[i + 1].volts;
+      float vIn    = v - curve[i + 1].volts;
+      uint8_t pSpan = curve[i].pct - curve[i + 1].pct;
+      return curve[i + 1].pct + (uint8_t)(pSpan * vIn / vSpan);
+    }
+  }
+  return 0;
+}
+
 void updatePixel() {
   static uint32_t lastColor = 0xFFFFFFFF;
   uint32_t color = 0;
@@ -285,7 +303,10 @@ void loop() {
       Serial.print(" dy=");
       Serial.print(dy);
       Serial.print(" vbat=");
-      Serial.println(latestVbat, 2);
+      Serial.print(latestVbat, 2);
+      Serial.print(" (");
+      Serial.print(vbatToPercent(latestVbat));
+      Serial.println("%)");
     }
   }
 
