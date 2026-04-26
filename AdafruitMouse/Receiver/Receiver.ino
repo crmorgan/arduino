@@ -5,6 +5,16 @@
 
 Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
+// --- NeoPixel state colors ------------------------------------------------
+// Named by function, not color, so swapping visuals only touches one place.
+#define PIX_HEAD_MOUSE     pixel.Color(  0, 255,   0)  // Head-mouse enabled
+#define PIX_JIGGLER        pixel.Color(  0, 255, 255)  // Jiggler active
+#define PIX_CALIBRATING    pixel.Color(  0,   0, 255)  // Auto-calibrating
+#define PIX_BATT_WARN      pixel.Color(255, 255,   0)  // Battery low warning
+#define PIX_BATT_DANGER    pixel.Color(255,   0,   0)  // Battery critical
+#define PIX_SENDER_SLEPT   pixel.Color(180,   0, 200)  // Sender intentionally slept
+// ---------------------------------------------------------------------------
+
 // --- Tuning ----------------------------------------------------------------
 #define INPUT_MAX           200   // Approx max raw accel value (a * 100 at 2g)
 #define DEADZONE_RAW         10   // Radial deadzone radius in raw units (noise)
@@ -14,6 +24,13 @@ Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 #define VBAT_WARN            3.5f // Below this: NeoPixel goes yellow
 #define VBAT_DANGER          3.3f // Below this: NeoPixel flashes red
 #define BAD_PACKET_LOG_MS  5000   // Throttle "discarded BLE packets" log
+// ---------------------------------------------------------------------------
+
+// --- Jiggler ---------------------------------------------------------------
+#define JIGGLER_BUTTON_PIN        11     // Toggle jiggler on/off
+#define JIGGLER_INTERVAL_MS       30000  // How often to nudge the cursor
+#define JIGGLER_NUDGE_PIXELS      1      // Pixel distance per nudge
+#define JIGGLER_RETURN_DELAY_MS   50     // Delay between out-nudge and back-nudge
 // ---------------------------------------------------------------------------
 
 uint8_t const desc_hid_report[] = { TUD_HID_REPORT_DESC_MOUSE() };
@@ -26,6 +43,7 @@ const uint8_t CALIBRATE_BUTTON_PIN = 10;
 
 ezButton enableButton(ENABLE_BUTTON_PIN);
 ezButton calibrateButton(CALIBRATE_BUTTON_PIN);
+ezButton jigglerButton(JIGGLER_BUTTON_PIN);
 
 volatile int16_t latestX = 0;
 volatile int16_t latestY = 0;
@@ -35,6 +53,10 @@ volatile bool dataValid = false;
 int16_t xOffset = 0;
 int16_t yOffset = 0;
 bool mouseEnabled = false;
+bool jigglerEnabled = false;
+uint32_t jigglerNextNudge = 0;
+bool jigglerWaitingReturn = false;
+uint32_t jigglerReturnAt = 0;
 
 // Sub-pixel cursor accumulators. File-scope so we can zero them on every
 // auto-cal start and not carry residual across sessions.
@@ -133,28 +155,32 @@ void updatePixel() {
   uint32_t color = 0;
   bool blinkPhase = ((millis() / 500) % 2) != 0;
 
+  // The "active" color depends on which mode is on. Mutually exclusive,
+  // so at most one is set. Head-mouse blinks when enabled but not paired
+  // to a Sender, so the user knows to wake/charge it.
+  uint32_t enabledColor = 0;
+  if (mouseEnabled) {
+    bool senderConnected = Bluefruit.connected();
+    enabledColor = senderConnected ? PIX_HEAD_MOUSE
+                                   : (blinkPhase ? PIX_HEAD_MOUSE : 0);
+  } else if (jigglerEnabled) {
+    enabledColor = PIX_JIGGLER;
+  }
+
   if (millis() < purpleUntil) {
-    color = pixel.Color(180, 0, 200);  // Purple - Sender intentionally slept
+    color = PIX_SENDER_SLEPT;
   } else if (calibrating) {
-    color = pixel.Color(0, 0, 255);  // Blue
+    color = PIX_CALIBRATING;
   } else if (latestVbat > 0.0f && latestVbat < VBAT_DANGER) {
-    // Danger: red blink. When mouse is enabled, off-phase becomes green so
-    // the enabled cue is still visible while the user reaches for a charger.
-    if (blinkPhase) {
-      color = pixel.Color(255, 0, 0);
-    } else {
-      color = mouseEnabled ? pixel.Color(0, 255, 0) : 0;
-    }
+    // Danger: blink. Off-phase becomes the enabled color so the active
+    // mode stays visible while the user reaches for a charger.
+    color = blinkPhase ? PIX_BATT_DANGER : enabledColor;
   } else if (latestVbat > 0.0f && latestVbat < VBAT_WARN) {
-    // Warn: solid yellow when disabled; alternate yellow/green at 1 Hz when
-    // enabled, so both battery state and enabled state are readable at once.
-    if (mouseEnabled && blinkPhase) {
-      color = pixel.Color(0, 255, 0);
-    } else {
-      color = pixel.Color(255, 255, 0);
-    }
-  } else if (mouseEnabled) {
-    color = pixel.Color(0, 255, 0);  // Green
+    // Warn: solid warn color when nothing's enabled; alternate warn/<enabled>
+    // at 1 Hz when an active mode is on.
+    color = (enabledColor != 0 && blinkPhase) ? enabledColor : PIX_BATT_WARN;
+  } else {
+    color = enabledColor;  // PIX_HEAD_MOUSE / PIX_JIGGLER / off
   }
 
   if (color != lastColor) {
@@ -217,6 +243,29 @@ void bleuart_rx_callback(BLEClientUart& uart_svc) {
   }
 }
 
+void jigglerTick() {
+  if (!jigglerEnabled) return;
+  if (!TinyUSBDevice.mounted() || !usb_hid.ready()) return;
+
+  uint32_t now = millis();
+
+  if (jigglerWaitingReturn) {
+    if (now < jigglerReturnAt) return;
+    usb_hid.mouseMove(0, -JIGGLER_NUDGE_PIXELS, 0);
+    jigglerWaitingReturn = false;
+    jigglerNextNudge = now + JIGGLER_INTERVAL_MS;
+    return;
+  }
+
+  if (now < jigglerNextNudge) return;
+
+  // Outgoing nudge - one pixel right. The return flips it back so net
+  // cursor movement is zero, just enough to register an OS input event.
+  usb_hid.mouseMove(0, JIGGLER_NUDGE_PIXELS, 0);
+  jigglerWaitingReturn = true;
+  jigglerReturnAt = now + JIGGLER_RETURN_DELAY_MS;
+}
+
 // Atomically read the latest BLE packet. Returns true and clears dataValid
 // when a fresh packet was consumed; false when no new data.
 bool snapshotRx(int16_t& x, int16_t& y, float& vbat) {
@@ -244,6 +293,7 @@ void setup() {
 
   enableButton.setDebounceTime(50);
   calibrateButton.setDebounceTime(50);
+  jigglerButton.setDebounceTime(50);
 
   pixel.begin();
   pixel.setBrightness(30);
@@ -271,10 +321,16 @@ void setup() {
 void loop() {
   enableButton.loop();
   calibrateButton.loop();
+  jigglerButton.loop();
 
   if (enableButton.isPressed() && !calibrating) {
     mouseEnabled = !mouseEnabled;
     if (mouseEnabled) {
+      // Mutual exclusion: jiggler and head-mouse fight for the cursor.
+      if (jigglerEnabled) {
+        jigglerEnabled = false;
+        Serial.println("Jiggler: OFF (head-mouse enabled)");
+      }
       calSumX = 0;
       calSumY = 0;
       calCount = 0;
@@ -285,6 +341,23 @@ void loop() {
       Serial.println("Mouse enabled: ON. Auto-calibrating - hold still...");
     } else {
       Serial.println("Mouse enabled: OFF");
+    }
+  }
+
+  if (jigglerButton.isPressed()) {
+    jigglerEnabled = !jigglerEnabled;
+    if (jigglerEnabled) {
+      if (mouseEnabled) {
+        mouseEnabled = false;
+        Serial.println("Mouse enabled: OFF (jiggler enabled)");
+      }
+      // Wait one full interval before the first nudge - acts as a small
+      // "I meant to press this" delay before activity starts.
+      jigglerNextNudge = millis() + JIGGLER_INTERVAL_MS;
+      jigglerWaitingReturn = false;
+      Serial.println("Jiggler: ON");
+    } else {
+      Serial.println("Jiggler: OFF");
     }
   }
 
@@ -343,6 +416,7 @@ void loop() {
       }
       calibrating = false;
     }
+    jigglerTick();
     updatePixel();
     return;
   }
@@ -398,5 +472,6 @@ void loop() {
     }
   }
 
+  jigglerTick();
   updatePixel();
 }

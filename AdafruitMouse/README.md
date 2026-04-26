@@ -21,9 +21,10 @@ The USER SW button on the Sender is used as the sleep/wake button.
 
 ### Receiver (USB dongle)
 - Adafruit Feather nRF52840 Express
-- Two momentary pushbuttons to GND
-  - Enable/disable HID output: pin `D9`
+- Three momentary pushbuttons to GND
+  - Enable/disable head-mouse HID output: pin `D9`
   - Calibrate (zero current tilt as neutral): pin `D10`
+  - Jiggler toggle (mouse-jiggler keep-awake mode): pin `D11`
 - Buttons use internal pull-ups (press = LOW), debounced in firmware.
 
 ## Libraries
@@ -61,6 +62,28 @@ Bluefruit is bundled with the Adafruit nRF52 BSP -- no separate install.
    first, so each enable starts from a fresh neutral.
 6. Press the **calibrate button** (`D10`) at any time to re-zero the
    current head position.
+7. Press the **jiggler button** (`D11`) to enable a tiny periodic cursor
+   nudge that defeats screen-lock / monitor-sleep timers (see Jiggler
+   below). Mutually exclusive with head-mouse - turning either on
+   automatically turns the other off.
+
+## Jiggler mode
+
+A keep-awake mode that emits a 1-pixel cursor nudge every 30 seconds
+(out then back, ~50 ms apart) so the host PC's idle timer keeps
+resetting and the screen never locks while you step away. Net cursor
+motion is zero so you don't return to a moved cursor.
+
+Works whether or not the Sender is paired - the Receiver acts as a
+standalone USB jiggler when the Sender is asleep, off, or absent.
+
+Tunables (in `Receiver.ino`):
+
+- `JIGGLER_INTERVAL_MS` (default `30000`) - time between nudges
+- `JIGGLER_NUDGE_PIXELS` (default `1`) - distance per nudge
+- `JIGGLER_RETURN_DELAY_MS` (default `50`) - delay between out and back
+
+NeoPixel turns cyan while jiggler is active.
 
 ## Sleep / power-off
 
@@ -111,13 +134,15 @@ Sleep extends this dramatically when not actively in use.
 
 | Color | Meaning |
 |-------|---------|
-| Off | Mouse disabled / idle |
+| Off | Idle (nothing enabled) |
 | Blue | Auto-calibrating (1.5 s after BLE connect or enable press) |
-| Green | Mouse enabled |
-| Yellow (solid) | Battery warning (< 3.5 V), mouse disabled |
-| Yellow / green alternating @ 1 Hz | Battery warning, mouse enabled |
-| Red blinking | Battery danger (< 3.3 V), mouse disabled |
-| Red / green alternating @ 1 Hz | Battery danger, mouse enabled |
+| Green (solid) | Head-mouse enabled and Sender paired |
+| Green (blinking) | Head-mouse enabled but Sender not paired - waiting for Sender to wake |
+| Cyan | Jiggler enabled |
+| Yellow (solid) | Battery warning (< 3.5 V), nothing enabled |
+| Yellow alternating with green or cyan @ 1 Hz | Battery warning, head-mouse or jiggler enabled |
+| Red blinking | Battery danger (< 3.3 V), nothing enabled |
+| Red alternating with green or cyan @ 1 Hz | Battery danger, head-mouse or jiggler enabled |
 | Purple | Sender just intentionally slept (~2 s flash) |
 
 ## Upload quirks
