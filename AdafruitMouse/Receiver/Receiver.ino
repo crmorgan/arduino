@@ -17,13 +17,16 @@ Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
 // --- Tuning ----------------------------------------------------------------
 #define INPUT_MAX           200   // Approx max raw accel value (a * 100 at 2g)
-#define DEADZONE_RAW         10   // Radial deadzone radius in raw units (noise)
-#define ACCEL_DIVISOR     12000   // x^2.5 curve divisor; lower = faster
+#define DEADZONE_RAW         20   // Radial deadzone radius in raw units (noise)
+#define ACCEL_DIVISOR        89   // x^1.5 curve divisor; lower = faster
+#define Y_DIVISOR            67   // Y-only divisor; preserves the 0.75 Y/X ratio
 #define OUTPUT_CLAMP         50   // Max per-sample cursor delta
 #define AUTO_CAL_MS        1500   // Averaging window for auto-calibrate on connect
 #define VBAT_WARN            3.5f // Below this: NeoPixel goes yellow
 #define VBAT_DANGER          3.3f // Below this: NeoPixel flashes red
 #define BAD_PACKET_LOG_MS  5000   // Throttle "discarded BLE packets" log
+#define NONPITCH_ACTIVE_THRESH  0.08f // rad/s; yaw or roll above = chip-tilt drift suspect
+#define PITCH_ACTIVE_THRESH     0.20f // rad/s; gyro.x above = real pitch in progress
 // ---------------------------------------------------------------------------
 
 // --- Jiggler ---------------------------------------------------------------
@@ -47,6 +50,9 @@ ezButton jigglerButton(JIGGLER_BUTTON_PIN);
 
 volatile int16_t latestX = 0;
 volatile int16_t latestY = 0;
+volatile float latestGx = 0.0f;
+volatile float latestGy = 0.0f;
+volatile float latestGz = 0.0f;
 volatile float latestVbat = 0.0f;
 volatile bool dataValid = false;
 
@@ -75,6 +81,8 @@ uint32_t purpleUntil = 0;
 // Counts BLE frames dropped for bad framing/prefix. Throttled-logged from loop.
 volatile uint32_t badPacketCount = 0;
 uint32_t lastBadPacketLog = 0;
+char lastBadPacket[64] = {0};
+volatile bool hasNewBadPacket = false;
 
 void scan_callback(ble_gap_evt_adv_report_t* report) {
   char name[32] = {0};
@@ -191,7 +199,7 @@ void updatePixel() {
 }
 
 void bleuart_rx_callback(BLEClientUart& uart_svc) {
-  static char rxbuf[32];
+  static char rxbuf[64];
   static size_t rxlen = 0;
 
   while (uart_svc.available()) {
@@ -202,41 +210,53 @@ void bleuart_rx_callback(BLEClientUart& uart_svc) {
       if (strcmp(rxbuf, "SLEEP") == 0) {
         senderRequestedSleep = true;
       } else if (rxbuf[0] == 'M' && rxlen > 1) {
-        // Movement packet: M<x>,<y>,<vbat>
-        char* body = rxbuf + 1;
-        char* comma1 = strchr(body, ',');
-        if (comma1) {
-          *comma1 = '\0';
-          int16_t newX = (int16_t)atoi(body);
-          int16_t newY;
-          float   newVbat = latestVbat;
-          char* rest = comma1 + 1;
-          char* comma2 = strchr(rest, ',');
-          if (comma2) {
-            *comma2 = '\0';
-            newY = (int16_t)atoi(rest);
-            newVbat = (float)atof(comma2 + 1);
-          } else {
-            newY = (int16_t)atoi(rest);
-          }
-          // Publish all three together so the main loop's snapshot sees a
-          // coherent triple rather than a torn mix from two packets.
+        // Movement packet: M<x>,<y>,<gx>,<gy>,<gz>,<vbat>
+        char* fields[6] = {rxbuf + 1, nullptr, nullptr, nullptr, nullptr, nullptr};
+        bool parseOk = true;
+        for (int i = 1; i < 6; i++) {
+          char* comma = strchr(fields[i - 1], ',');
+          if (!comma) { parseOk = false; break; }
+          *comma = '\0';
+          fields[i] = comma + 1;
+        }
+        if (parseOk) {
+          int16_t newX  = (int16_t)atoi(fields[0]);
+          int16_t newY  = (int16_t)atoi(fields[1]);
+          float newGx   = (float)atof(fields[2]);
+          float newGy   = (float)atof(fields[3]);
+          float newGz   = (float)atof(fields[4]);
+          float newVbat = (float)atof(fields[5]);
+          // Publish all six together so the main loop's snapshot sees a
+          // coherent set rather than a torn mix from partial updates.
           noInterrupts();
-          latestX = newX;
-          latestY = newY;
+          latestX    = newX;
+          latestY    = newY;
+          latestGx   = newGx;
+          latestGy   = newGy;
+          latestGz   = newGz;
           latestVbat = newVbat;
-          dataValid = true;
+          dataValid  = true;
           interrupts();
         } else {
+          strncpy(lastBadPacket, rxbuf, sizeof(lastBadPacket) - 1);
+          lastBadPacket[sizeof(lastBadPacket) - 1] = '\0';
+          hasNewBadPacket = true;
           badPacketCount++;
         }
       } else {
+        strncpy(lastBadPacket, rxbuf, sizeof(lastBadPacket) - 1);
+        lastBadPacket[sizeof(lastBadPacket) - 1] = '\0';
+        hasNewBadPacket = true;
         badPacketCount++;
       }
       rxlen = 0;
     } else if (rxlen < sizeof(rxbuf) - 1) {
       rxbuf[rxlen++] = c;
     } else {
+      rxbuf[sizeof(rxbuf) - 1] = '\0';
+      strncpy(lastBadPacket, rxbuf, sizeof(lastBadPacket) - 1);
+      lastBadPacket[sizeof(lastBadPacket) - 1] = '\0';
+      hasNewBadPacket = true;
       rxlen = 0;  // Overflow, discard.
       badPacketCount++;
     }
@@ -268,13 +288,17 @@ void jigglerTick() {
 
 // Atomically read the latest BLE packet. Returns true and clears dataValid
 // when a fresh packet was consumed; false when no new data.
-bool snapshotRx(int16_t& x, int16_t& y, float& vbat) {
+bool snapshotRx(int16_t& x, int16_t& y,
+                float& gx, float& gy, float& gz, float& vbat) {
   bool got;
   noInterrupts();
   got = dataValid;
   if (got) {
     x = latestX;
     y = latestY;
+    gx = latestGx;
+    gy = latestGy;
+    gz = latestGz;
     vbat = latestVbat;
     dataValid = false;
   }
@@ -300,6 +324,9 @@ void setup() {
   pixel.clear();
   pixel.show();
 
+  // Match Sender's MTU bump so the negotiated MTU lands at 247 and full
+  // movement packets arrive in one notify instead of being truncated.
+  Bluefruit.configCentralBandwidth(BANDWIDTH_MAX);
   Bluefruit.begin(0, 1);
   Bluefruit.setName("MPU6050_Receiver");
 
@@ -389,13 +416,21 @@ void loop() {
     Serial.print(" new, ");
     Serial.print(badNow);
     Serial.println(" total");
+    if (hasNewBadPacket) {
+      Serial.print("  Sample: '");
+      Serial.print(lastBadPacket);
+      Serial.print("' (");
+      Serial.print(strlen(lastBadPacket));
+      Serial.println(" chars)");
+      hasNewBadPacket = false;
+    }
     lastBadPacketCount = badNow;
     lastBadPacketLog = millis();
   }
 
   int16_t curX = 0, curY = 0;
-  float   curVbat = 0.0f;
-  bool fresh = snapshotRx(curX, curY, curVbat);
+  float   curGx = 0.0f, curGy = 0.0f, curGz = 0.0f, curVbat = 0.0f;
+  bool fresh = snapshotRx(curX, curY, curGx, curGy, curGz, curVbat);
 
   if (calibrating) {
     if (fresh) {
@@ -423,7 +458,13 @@ void loop() {
 
   if (fresh) {
     int16_t raw_x = curX - xOffset;
-    int16_t raw_y = curY - yOffset;
+    // Suppress y when non-pitch motion (yaw or roll) is active without a real
+    // pitch - that's the chip-tilt drift, not a nod. Using yOffset directly as
+    // the rest reference avoids any anchor-matching mismatch.
+    bool nonPitch    = fabsf(curGz) > NONPITCH_ACTIVE_THRESH ||
+                       fabsf(curGy) > NONPITCH_ACTIVE_THRESH;
+    bool pitchActive = fabsf(curGx) > PITCH_ACTIVE_THRESH;
+    int16_t raw_y    = (nonPitch && !pitchActive) ? 0 : (int16_t)(curY - yOffset);
     raw_x = constrain(raw_x, -INPUT_MAX, INPUT_MAX);
     raw_y = constrain(raw_y, -INPUT_MAX, INPUT_MAX);
 
@@ -437,8 +478,8 @@ void loop() {
 
     float absX = fabsf((float)raw_x);
     float absY = fabsf((float)raw_y);
-    float magX = absX * absX * sqrtf(absX) / (float)ACCEL_DIVISOR;
-    float magY = absY * absY * sqrtf(absY) / (float)ACCEL_DIVISOR;
+    float magX = absX * sqrtf(absX) / (float)ACCEL_DIVISOR;
+    float magY = absY * sqrtf(absY) / (float)Y_DIVISOR;
     float step_x = raw_x < 0 ? -magX : magX;
     float step_y = raw_y < 0 ? -magY : magY;
     step_x = constrain(step_x, (float)-OUTPUT_CLAMP, (float)OUTPUT_CLAMP);

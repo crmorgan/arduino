@@ -41,6 +41,7 @@ int16_t prevAy = 0;
 uint32_t lastMotionMs = 0;
 bool motionBaselineSet = false;
 
+
 float readBattery() {
   // Feather nRF52840 Express: VBAT -> 1M/1M divider -> PIN_VBAT,
   // read with 12-bit ADC against 3.0 V internal reference.
@@ -149,6 +150,9 @@ void setup() {
   pixel.setPixelColor(0, 0, 0, 0);
   pixel.show();
 
+  // Bump MTU to 247 so the longer "M<x>,<y>,<gx>,<gy>,<gz>,<vbat>" packet
+  // fits in a single BLE notify and doesn't get truncated.
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
   Bluefruit.begin();
   Bluefruit.setName("MPU6050_Sender");
 
@@ -285,14 +289,23 @@ void loop() {
     Serial.print(x);
     Serial.print(" ");
     Serial.print(y);
+    Serial.print(" gx=");
+    Serial.print(g.gyro.x, 2);
+    Serial.print(" gy=");
+    Serial.print(g.gyro.y, 2);
+    Serial.print(" gz=");
+    Serial.print(g.gyro.z, 2);
     Serial.print(" vbat=");
     Serial.println(latestVbat, 2);
   }
 
   // 'M' prefix lets the Receiver discard non-movement junk (BLE flake, partial
   // frames, future protocol drift) instead of feeding atoi() = 0 to the cursor.
-  char buf[25];
-  snprintf(buf, sizeof(buf), "M%d,%d,%.2f\n", x, y, latestVbat);
+  // Format: M<x>,<y>,<gx>,<gy>,<gz>,<vbat> - gyros let Receiver suppress
+  // chip-tilt drift during yaw without needing its own anchor.
+  char buf[60];
+  snprintf(buf, sizeof(buf), "M%d,%d,%.2f,%.2f,%.2f,%.2f\n",
+           x, y, g.gyro.x, g.gyro.y, g.gyro.z, latestVbat);
   bleuart.print(buf);
 
   delay(20);
